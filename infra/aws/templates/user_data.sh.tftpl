@@ -1,6 +1,6 @@
 #!/bin/bash
 # Bootstraps the k3s node. Rendered by Terraform templatefile():
-# $${...} below is a literal bash variable, ${...} is filled in by Terraform.
+# Variables like REGION are filled in by Terraform when it renders this file.
 set -euxo pipefail
 exec > >(tee /var/log/cloudpulse-bootstrap.log) 2>&1
 
