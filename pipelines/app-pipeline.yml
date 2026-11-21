@@ -1,0 +1,171 @@
+# CloudPulse app pipeline (Azure DevOps -> AWS)
+#
+#   CI  : lint -> unit tests -> docker build -> Trivy scan -> push image + Helm chart to ECR
+#   DEV : deploy to k3s 'dev' namespace via SSM -> smoke test
+#   PROD: manual approval (environment check) -> deploy the SAME image/chart to 'prod' -> smoke test
+#
+# Needs in Azure DevOps:
+#   - Service connection (type "AWS", from the AWS Toolkit extension) named: aws-cloudpulse
+#   - Environments: cloudpulse-dev, cloudpulse-prod (add an Approval check on cloudpulse-prod)
+
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [app/*, deploy/*, pipelines/app-pipeline.yml]
+
+pr:
+  branches:
+    include: [main]
+  paths:
+    include: [app/*, deploy/*, pipelines/app-pipeline.yml]
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  awsConnection: aws-cloudpulse
+  awsRegion: eu-west-1
+  project: cloudpulse
+  pythonVersion: "3.12"
+  trivyVersion: "0.58.1"
+  shortSha: $[substring(variables['Build.SourceVersion'], 0, 7)]
+  # <BuildId>-<short sha>: unique, traceable back to the run and the commit
+  imageTag: $(Build.BuildId)-$(shortSha)
+  chartVersion: 1.0.$(Build.BuildId)
+  isMain: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+
+stages:
+  # ---------------------------------------------------------------- CI
+  - stage: CI
+    displayName: Build & test
+    jobs:
+      - job: Test
+        displayName: Lint + unit tests
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(pythonVersion)
+
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -r requirements-dev.txt
+            workingDirectory: app
+            displayName: Install dependencies
+
+          - script: |
+              ruff check .
+              ruff format --check .
+            workingDirectory: app
+            displayName: Lint (ruff)
+
+          - script: pytest --junitxml=test-results.xml
+            workingDirectory: app
+            displayName: Unit tests (pytest + moto)
+
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFiles: app/test-results.xml
+              testRunTitle: CloudPulse unit tests
+
+          - script: |
+              helm lint deploy/helm/cloudpulse -f deploy/helm/cloudpulse/values-prod.yaml \
+                --set image.repository=example/cloudpulse --set image.tag=test --set ingress.host=test.local
+              helm template t deploy/helm/cloudpulse -f deploy/helm/cloudpulse/values-prod.yaml \
+                --set image.repository=example/cloudpulse --set image.tag=test --set ingress.host=test.local > /dev/null
+            displayName: Helm lint + template
+
+      - job: Build
+        displayName: Build, scan, push
+        dependsOn: Test
+        # PRs build and scan but never push
+        steps:
+          - script: |
+              docker build \
+                --label org.opencontainers.image.revision=$(Build.SourceVersion) \
+                --label org.opencontainers.image.source=https://github.com/kirthikesh/cloudpulse \
+                --label ado.build.id=$(Build.BuildId) \
+                -t $(project):$(imageTag) app
+            displayName: Docker build
+
+          - script: |
+              curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+                | sh -s -- -b /usr/local/bin v$(trivyVersion)
+              trivy image --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed \
+                --format table $(project):$(imageTag)
+            displayName: Trivy image scan (fail on HIGH/CRITICAL)
+
+          - task: AWSShellScript@1
+            displayName: Push image + Helm chart to ECR
+            condition: and(succeeded(), eq(variables.isMain, true))
+            inputs:
+              awsCredentials: $(awsConnection)
+              regionName: $(awsRegion)
+              scriptType: inline
+              inlineScript: |
+                set -euo pipefail
+                ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                REGISTRY="${ACCOUNT_ID}.dkr.ecr.$(awsRegion).amazonaws.com"
+
+                aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+                docker tag $(project):$(imageTag) "$REGISTRY/$(project):$(imageTag)"
+                docker push "$REGISTRY/$(project):$(imageTag)"
+
+                aws ecr get-login-password | helm registry login "$REGISTRY" --username AWS --password-stdin
+                helm package deploy/helm/cloudpulse --version $(chartVersion) --app-version $(imageTag) -d .chart
+                helm push .chart/$(project)-$(chartVersion).tgz "oci://$REGISTRY/charts"
+
+                echo "Pushed $REGISTRY/$(project):$(imageTag) and chart $(chartVersion)"
+
+  # ---------------------------------------------------------------- DEV
+  - stage: DeployDev
+    displayName: Deploy dev
+    dependsOn: CI
+    condition: and(succeeded(), eq(variables.isMain, true))
+    jobs:
+      - deployment: Dev
+        environment: cloudpulse-dev
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: AWSShellScript@1
+                  name: deploy
+                  displayName: Helm upgrade on k3s via SSM
+                  inputs:
+                    awsCredentials: $(awsConnection)
+                    regionName: $(awsRegion)
+                    scriptType: filePath
+                    filePath: $(System.DefaultWorkingDirectory)/deploy/scripts/ssm-deploy.sh
+                    arguments: dev $(imageTag) $(chartVersion)
+                - script: $(System.DefaultWorkingDirectory)/deploy/scripts/smoke-test.sh "$(appUrl)" "$(imageTag)"
+                  displayName: Smoke test dev
+
+  # ---------------------------------------------------------------- PROD
+  - stage: DeployProd
+    displayName: Deploy prod
+    dependsOn: DeployDev
+    condition: and(succeeded(), eq(variables.isMain, true))
+    jobs:
+      - deployment: Prod
+        environment: cloudpulse-prod   # approval check lives on this environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - task: AWSShellScript@1
+                  name: deploy
+                  displayName: Helm upgrade on k3s via SSM (same artifact as dev)
+                  inputs:
+                    awsCredentials: $(awsConnection)
+                    regionName: $(awsRegion)
+                    scriptType: filePath
+                    filePath: $(System.DefaultWorkingDirectory)/deploy/scripts/ssm-deploy.sh
+                    arguments: prod $(imageTag) $(chartVersion)
+                - script: $(System.DefaultWorkingDirectory)/deploy/scripts/smoke-test.sh "$(appUrl)" "$(imageTag)"
+                  displayName: Smoke test prod

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+app/test-results.xml
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+terraform.tfvars
+crash.log
+
+# Helm
+.chart/
+*.tgz
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,7 @@
+apiVersion: v2
+name: cloudpulse
+description: CloudPulse uptime monitor (API + dashboard + check worker)
+type: application
+# version/appVersion are overwritten by the pipeline: helm package --version 1.0.<BuildId> --app-version <imageTag>
+version: 1.0.0
+appVersion: "1.0.0"

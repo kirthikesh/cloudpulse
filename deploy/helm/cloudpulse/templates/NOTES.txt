@@ -1,0 +1,2 @@
+CloudPulse {{ .Values.env }} deployed: image {{ .Values.image.tag }}
+Dashboard: http://{{ .Values.ingress.host }}

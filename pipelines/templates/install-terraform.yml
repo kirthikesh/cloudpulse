@@ -1,0 +1,16 @@
+parameters:
+  - name: version
+    type: string
+
+steps:
+  - script: |
+      set -euo pipefail
+      if terraform version 2>/dev/null | head -1 | grep -q "v${{ parameters.version }}"; then
+        echo "terraform ${{ parameters.version }} already installed"; exit 0
+      fi
+      cd /tmp
+      curl -fsSLO "https://releases.hashicorp.com/terraform/${{ parameters.version }}/terraform_${{ parameters.version }}_linux_amd64.zip"
+      unzip -o -q "terraform_${{ parameters.version }}_linux_amd64.zip"
+      sudo mv terraform /usr/local/bin/terraform
+      terraform version
+    displayName: Install Terraform ${{ parameters.version }}

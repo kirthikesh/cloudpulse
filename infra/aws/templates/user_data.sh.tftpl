@@ -1,0 +1,73 @@
+#!/bin/bash
+# Bootstraps the k3s node. Rendered by Terraform templatefile():
+# $${...} below is a literal bash variable, ${...} is filled in by Terraform.
+set -euxo pipefail
+exec > >(tee /var/log/cloudpulse-bootstrap.log) 2>&1
+
+REGION="${region}"
+REGISTRY="${registry}"
+NAMESPACES="${namespaces}"
+
+# --- base packages (aws cli v2 ships with AL2023) ---
+dnf install -y jq tar gzip
+
+# --- k3s (single node; Traefik ingress on :80, ServiceLB and metrics-server come built in) ---
+curl -sfL https://get.k3s.io | INSTALL_K3S_CHANNEL="${k3s_channel}" \
+  INSTALL_K3S_EXEC="server --write-kubeconfig-mode 0640" sh -
+
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+echo 'export KUBECONFIG=/etc/rancher/k3s/k3s.yaml' > /etc/profile.d/k3s.sh
+
+until kubectl get nodes 2>/dev/null | grep -q " Ready"; do sleep 5; done
+
+# --- helm (used by the SSM deploy script) ---
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 \
+  | DESIRED_VERSION="${helm_version}" HELM_INSTALL_DIR=/usr/local/bin bash
+
+# --- app namespaces with Pod Security "restricted" enforced ---
+for ns in $NAMESPACES; do
+  kubectl create namespace "$ns" --dry-run=client -o yaml | kubectl apply -f -
+  kubectl label namespace "$ns" --overwrite \
+    pod-security.kubernetes.io/enforce=restricted \
+    pod-security.kubernetes.io/warn=restricted
+done
+
+# --- ECR pull secret refresher (ECR tokens expire after 12h) ---
+cat > /usr/local/bin/ecr-refresh.sh <<EOF
+#!/bin/bash
+set -euo pipefail
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+TOKEN=\$(aws ecr get-login-password --region $REGION)
+for ns in $NAMESPACES; do
+  kubectl -n "\$ns" create secret docker-registry ecr-pull \
+    --docker-server=$REGISTRY --docker-username=AWS --docker-password="\$TOKEN" \
+    --dry-run=client -o yaml | kubectl apply -f -
+done
+EOF
+chmod 0755 /usr/local/bin/ecr-refresh.sh
+
+cat > /etc/systemd/system/ecr-refresh.service <<'EOF'
+[Unit]
+Description=Refresh ECR image pull secret for k3s
+After=k3s.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ecr-refresh.sh
+EOF
+
+cat > /etc/systemd/system/ecr-refresh.timer <<'EOF'
+[Unit]
+Description=Refresh ECR pull secret every 6 hours
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=6h
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now ecr-refresh.timer
+/usr/local/bin/ecr-refresh.sh
+
+touch /var/lib/cloudpulse-bootstrap-done
+echo "bootstrap complete"

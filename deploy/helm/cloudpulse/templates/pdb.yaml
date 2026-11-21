@@ -1,0 +1,13 @@
+{{- if or .Values.api.autoscaling.enabled (gt (int .Values.api.replicas) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-api
+  labels: {{- include "cloudpulse.labels" . | nindent 4 }}
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      {{- include "cloudpulse.selector" . | nindent 6 }}
+      app.kubernetes.io/component: api
+{{- end }}

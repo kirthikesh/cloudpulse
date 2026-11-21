@@ -1,0 +1,9 @@
+env: prod
+api:
+  replicas: 2
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+worker:
+  checkIntervalSeconds: 60

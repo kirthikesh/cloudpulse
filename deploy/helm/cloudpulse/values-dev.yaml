@@ -1,0 +1,5 @@
+env: dev
+api:
+  replicas: 1
+worker:
+  checkIntervalSeconds: 30

@@ -1,0 +1,109 @@
+# CloudPulse infra pipeline: Terraform for AWS, run from Azure DevOps.
+#
+#   Validate: fmt check -> init -> validate -> Checkov security scan
+#   Plan    : terraform plan, saved as a pipeline artifact
+#   Apply   : manual approval (environment check) -> apply the exact saved plan
+#
+# Needs in Azure DevOps:
+#   - Service connection (type "AWS") named: aws-cloudpulse-infra
+#     (a separate IAM identity with permission to manage VPC/EC2/ECR/DynamoDB/IAM/CloudWatch/SNS/S3 state)
+#   - Pipeline variable TF_STATE_BUCKET = cloudpulse-tfstate-<account-id> (output of infra/bootstrap)
+#   - Environment: cloudpulse-infra (add an Approval check)
+
+trigger:
+  branches:
+    include: [main]
+  paths:
+    include: [infra/aws/*, pipelines/infra-pipeline.yml]
+
+pr:
+  branches:
+    include: [main]
+  paths:
+    include: [infra/aws/*, pipelines/infra-pipeline.yml]
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  awsConnection: aws-cloudpulse-infra
+  awsRegion: eu-west-1
+  terraformVersion: "1.10.5"
+  tfDir: infra/aws
+  isMain: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+
+stages:
+  - stage: Validate
+    jobs:
+      - job: Validate
+        steps:
+          - template: templates/install-terraform.yml
+            parameters:
+              version: $(terraformVersion)
+
+          - script: terraform fmt -check -recursive infra
+            displayName: terraform fmt
+
+          - script: |
+              terraform -chdir=$(tfDir) init -backend=false
+              terraform -chdir=$(tfDir) validate
+            displayName: terraform validate
+
+          - script: |
+              pip install --quiet checkov
+              checkov -d infra --framework terraform --config-file infra/.checkov.yml
+            displayName: Checkov security scan
+
+  - stage: Plan
+    dependsOn: Validate
+    jobs:
+      - job: Plan
+        steps:
+          - template: templates/install-terraform.yml
+            parameters:
+              version: $(terraformVersion)
+
+          - task: AWSShellScript@1
+            displayName: terraform plan
+            inputs:
+              awsCredentials: $(awsConnection)
+              regionName: $(awsRegion)
+              scriptType: inline
+              inlineScript: |
+                set -euo pipefail
+                terraform -chdir=$(tfDir) init -input=false -backend-config="bucket=$(TF_STATE_BUCKET)"
+                terraform -chdir=$(tfDir) plan -input=false -out=tfplan
+                terraform -chdir=$(tfDir) show -no-color tfplan > $(Build.ArtifactStagingDirectory)/plan.txt
+                cp $(tfDir)/tfplan $(Build.ArtifactStagingDirectory)/
+
+          - publish: $(Build.ArtifactStagingDirectory)
+            artifact: tfplan
+            displayName: Publish plan
+
+  - stage: Apply
+    dependsOn: Plan
+    condition: and(succeeded(), eq(variables.isMain, true))
+    jobs:
+      - deployment: Apply
+        environment: cloudpulse-infra   # approval check: review plan.txt before approving
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - download: current
+                  artifact: tfplan
+                - template: templates/install-terraform.yml
+                  parameters:
+                    version: $(terraformVersion)
+                - task: AWSShellScript@1
+                  displayName: terraform apply (saved plan)
+                  inputs:
+                    awsCredentials: $(awsConnection)
+                    regionName: $(awsRegion)
+                    scriptType: inline
+                    inlineScript: |
+                      set -euo pipefail
+                      terraform -chdir=$(tfDir) init -input=false -backend-config="bucket=$(TF_STATE_BUCKET)"
+                      terraform -chdir=$(tfDir) apply -input=false $(Pipeline.Workspace)/tfplan/tfplan
+                      terraform -chdir=$(tfDir) output

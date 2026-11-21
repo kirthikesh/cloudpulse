@@ -1,0 +1,42 @@
+env: dev
+
+image:
+  repository: ""        # <account>.dkr.ecr.eu-west-1.amazonaws.com/cloudpulse (set by pipeline)
+  tag: ""               # <BuildId>-<shortSha> (set by pipeline)
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: ecr-pull      # refreshed on the node every 6h by ecr-refresh.timer
+
+build:
+  id: local
+  gitSha: local
+
+aws:
+  region: eu-west-1
+  tableName: ""         # cloudpulse-<env>
+
+api:
+  replicas: 1
+  resources:
+    requests: { cpu: 50m, memory: 96Mi }
+    limits: { cpu: 300m, memory: 192Mi }
+  autoscaling:
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 70
+
+worker:
+  enabled: true
+  checkIntervalSeconds: 60
+  checkTimeoutSeconds: 5
+  resultTtlDays: 7
+  resources:
+    requests: { cpu: 25m, memory: 80Mi }
+    limits: { cpu: 200m, memory: 160Mi }
+
+ingress:
+  enabled: true
+  className: traefik
+  host: ""              # dev.<node-ip>.nip.io (set by deploy script)
